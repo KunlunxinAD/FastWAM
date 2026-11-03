@@ -2,6 +2,7 @@
 """Precompute VAE latents for the training dataset."""
 
 import argparse
+import fcntl
 import os
 import pathlib
 import time
@@ -14,6 +15,9 @@ class IndexedVideoOnly(torch.utils.data.Dataset):
     def __init__(self, dataset, indices):
         self.dataset = dataset
         self.indices = indices
+        # Encode the requested index, even when it contains padding.
+        self.dataset.max_padding_retry = 0
+        self.dataset.latent_cache_root = None
 
     def __len__(self):
         return len(self.indices)
@@ -89,7 +93,12 @@ def main():
     from fastwam.datasets.lerobot import latent_cache
 
     n = len(dataset)
-    latent_shape = (48, 3, 14, 28)
+    latent_shape = (
+        48,
+        (len(dataset.video_sample_indices) - 1) // 4 + 1,
+        int(dataset.video_size[0]) // 16,
+        int(dataset.video_size[1]) // 16,
+    )
     item_bytes = int(np.prod(latent_shape)) * 2
     if args.check:
         state = latent_cache.status(args.root, dataset)
@@ -105,25 +114,26 @@ def main():
 
     output = pathlib.Path(latent_cache.cache_dir(args.root, fingerprint_value))
     output.mkdir(parents=True, exist_ok=True)
-    metadata_path = output / latent_cache.META_FILE
-    if rank == 0 and not metadata_path.exists():
-        latent_cache.write_meta(
-            str(output), n, latent_shape, fingerprint_value,
-            extra={"task": args.task, "video_backend": args.video_backend},
-        )
-    while not metadata_path.exists():
-        time.sleep(0.5)
-
-    for path, shape in (
-        (output / latent_cache.LATENTS_FILE, (n, item_bytes)),
-        (output / latent_cache.DONE_FILE, (n,)),
-    ):
-        if not path.exists():
-            np.memmap(path, dtype=np.uint8, mode="w+", shape=shape).flush()
+    with open(output / ".init.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        metadata_path = output / latent_cache.META_FILE
+        if not metadata_path.exists():
+            latent_cache.write_meta(
+                str(output), n, latent_shape, fingerprint_value,
+                extra={"task": args.task, "video_backend": args.video_backend},
+            )
+        for path, shape in (
+            (output / latent_cache.LATENTS_FILE, (n, item_bytes)),
+            (output / latent_cache.DONE_FILE, (n,)),
+        ):
+            if not path.exists():
+                np.memmap(path, dtype=np.uint8, mode="w+", shape=shape).flush()
     latents, done, _ = latent_cache.open_cache(
         str(output), n, fingerprint_value, mode="r+"
     )
-    todo = np.nonzero(done == 0)[0][rank::world]
+    # Assign ownership before filtering, so concurrent writes cannot shift ranks.
+    owned = np.arange(rank, n, world)
+    todo = owned[done[owned] == 0]
     if args.limit:
         todo = todo[:args.limit]
     if len(todo) == 0:
@@ -139,20 +149,27 @@ def main():
         drop_last=False,
     )
     started = time.time()
+    seen = 0
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
             video = batch["video"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
             encoded = vae.model.encode(video, vae.scale)
             raw = encoded.contiguous().view(torch.uint8).cpu().numpy()
             raw = raw.reshape(video.shape[0], -1)
+            if tuple(encoded.shape[1:]) != latent_shape:
+                raise ValueError(f"Unexpected VAE latent shape: {tuple(encoded.shape)}")
             for offset, index in enumerate(batch["idx"].tolist()):
                 latents[index] = raw[offset]
+            latents.flush()
+            for index in batch["idx"].tolist():
                 done[index] = 1
+            done.flush()
+            seen += video.shape[0]
             if batch_index % 20 == 0:
                 elapsed = time.time() - started
                 print(
                     f"[rank{rank}] {batch_index} batches, "
-                    f"{batch['video'].shape[0] / max(elapsed, 1e-9):.1f} samples/s",
+                    f"{seen / max(elapsed, 1e-9):.1f} samples/s",
                     flush=True,
                 )
             if args.time_budget and time.time() - started > args.time_budget:

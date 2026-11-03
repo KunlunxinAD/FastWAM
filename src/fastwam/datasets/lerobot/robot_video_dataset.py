@@ -65,6 +65,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.action_video_freq_ratio = action_video_freq_ratio
         self.dataset_dirs = [str(directory) for directory in dataset_dirs]
         self.global_sample_stride = global_sample_stride
+        self.is_training_set = bool(is_training_set)
+        self.val_set_proportion = float(val_set_proportion)
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"

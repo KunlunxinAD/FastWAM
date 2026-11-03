@@ -45,6 +45,7 @@ if [[ -n "${STEPS}" ]]; then OVERRIDES+=("max_steps=${STEPS}"); fi
 
 if [[ -n "${FASTWAM_LATENT_CACHE_ROOT:-}" && "${LATENT_CACHE_AUTO:-1}" == "1" ]]; then
   LATENT_CACHE_ROOT="${FASTWAM_LATENT_CACHE_ROOT}" DEVICES="${DEVICES}" TASK="${TASK}" \
+    STATS_PATH="${STATS_PATH}" VIDEO_BACKEND="${VIDEO_BACKEND}" \
     bash scripts/ensure_latent_cache.sh
 fi
 

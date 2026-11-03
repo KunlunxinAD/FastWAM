@@ -13,7 +13,7 @@ from accelerate import Accelerator
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
@@ -23,6 +23,15 @@ from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+def collate_training_samples(samples):
+    # A mixed cache batch must use online encoding for every sample.
+    if any("cached_latents" not in sample for sample in samples):
+        samples = [
+            {key: value for key, value in sample.items() if key != "cached_latents"}
+            for sample in samples
+        ]
+    return default_collate(samples)
 
 
 class Wan22Trainer:
@@ -131,6 +140,7 @@ class Wan22Trainer:
                 shuffle=False,
                 sampler=self.train_sampler,
                 num_workers=0,
+                collate_fn=collate_training_samples,
             )
             warmup_sample = next(iter(warmup_loader))
             with self.accelerator.autocast():
@@ -207,6 +217,7 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            collate_fn=collate_training_samples,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):

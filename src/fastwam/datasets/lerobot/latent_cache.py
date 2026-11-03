@@ -20,6 +20,9 @@ def fingerprint(dataset) -> str:
         "video_size": [int(value) for value in (getattr(dataset, "video_size", None) or [])],
         "action_video_freq_ratio": int(getattr(dataset, "action_video_freq_ratio", -1)),
         "concat_multi_camera": str(getattr(dataset, "concat_multi_camera", "")),
+        "camera_key": str(getattr(dataset, "camera_key", None)),
+        "is_training_set": bool(getattr(dataset, "is_training_set", False)),
+        "val_set_proportion": float(getattr(dataset, "val_set_proportion", 0.05)),
         "global_sample_stride": int(getattr(dataset, "global_sample_stride", -1)),
         "skip_padding_as_possible": bool(
             getattr(dataset, "skip_padding_as_possible", False)
