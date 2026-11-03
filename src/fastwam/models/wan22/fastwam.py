@@ -336,8 +336,16 @@ class FastWAM(torch.nn.Module):
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
         
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_latents = self._encode_video_latents(input_video, tiled=tiled)
+        cached_latents = sample.get("cached_latents", None)
+        if cached_latents is not None:
+            input_latents = cached_latents.to(
+                device=self.device, dtype=self.torch_dtype, non_blocking=True
+            )
+        else:
+            input_video = video.to(
+                device=self.device, dtype=self.torch_dtype, non_blocking=True
+            )
+            input_latents = self._encode_video_latents(input_video, tiled=tiled)
         context = sample.get("context")
         context_mask = sample.get("context_mask")
         if context is None and context_mask is None:

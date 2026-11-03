@@ -63,6 +63,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
+        self.dataset_dirs = [str(directory) for directory in dataset_dirs]
+        self.global_sample_stride = global_sample_stride
+        self.is_training_set = bool(is_training_set)
+        self.val_set_proportion = float(val_set_proportion)
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
@@ -76,6 +80,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.use_text_embed_cache = bool(use_text_embed_cache)
+        self.latent_cache_root = (
+            os.environ.get("FASTWAM_LATENT_CACHE_ROOT", "") or ""
+        ).strip() or None
+        self._lat_mm = None
+        self._lat_done = None
+        self._lat_shape = None
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
@@ -238,6 +248,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if sample_idx == idx:
+            cached_latent = self._maybe_cached_latent(idx)
+            if cached_latent is not None:
+                data["cached_latents"] = cached_latent
+
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
             # NOTE: to keep consistent with wan2.2's behavior
@@ -245,6 +260,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data["context"] = context
             data["context_mask"] = torch.ones_like(context_mask)
         return data
+
+    def _maybe_cached_latent(self, idx: int):
+        """Return a validated cached latent, or None when the entry is missing."""
+        if self.latent_cache_root is None:
+            return None
+        if self._lat_mm is None:
+            from . import latent_cache as lc
+
+            fingerprint = lc.fingerprint(self)
+            cache_path = lc.cache_dir(self.latent_cache_root, fingerprint)
+            self._lat_mm, self._lat_done, meta = lc.open_cache(
+                cache_path, len(self), fingerprint, mode="r"
+            )
+            self._lat_shape = tuple(meta["latent_shape"])
+        if not bool(self._lat_done[idx]):
+            return None
+        buffer = bytearray(self._lat_mm[idx].tobytes())
+        return torch.frombuffer(buffer, dtype=torch.bfloat16).reshape(self._lat_shape)
 
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:
