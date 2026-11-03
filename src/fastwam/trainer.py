@@ -42,6 +42,11 @@ class Wan22Trainer:
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
+        _stl = cfg.get("save_total_limit", 0)
+        self.save_total_limit = int(_stl) if _stl else 0
+        self.save_state_enabled = str(
+            os.environ.get("FASTWAM_SAVE_STATE", "1")
+        ).strip().lower() not in {"0", "false", "no"}
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
@@ -612,14 +617,58 @@ class Wan22Trainer:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
+        state_path = None
+        if self.save_state_enabled:
+            state_path = os.path.join(self.state_dir, step_tag)
+            ensure_dir(state_path)
+            self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path)
+            self.accelerator.wait_for_everyone()
+        elif self.accelerator.is_main_process:
+            logger.info("[ckpt] FASTWAM_SAVE_STATE=0 -> skipped ZeRO state save")
+
         if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
+            self._prune_old_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _prune_old_checkpoints(self):
+        """Keep only the most recent configured checkpoints."""
+        if self.save_total_limit <= 0:
+            return
+        import shutil
+
+        def _step_of(name: str):
+            match = re.search(r"step[_-](\d+)$", name)
+            return int(match.group(1)) if match else None
+
+        if os.path.isdir(self.state_dir):
+            state_dirs = [
+                (name, _step_of(name))
+                for name in os.listdir(self.state_dir)
+                if os.path.isdir(os.path.join(self.state_dir, name))
+                and _step_of(name) is not None
+            ]
+            state_dirs.sort(key=lambda item: item[1])
+            for name, _ in state_dirs[:-self.save_total_limit]:
+                shutil.rmtree(os.path.join(self.state_dir, name), ignore_errors=True)
+                logger.info("Pruned old checkpoint state: %s", name)
+
+        if os.path.isdir(self.weights_dir):
+            weight_files = [
+                (name, _step_of(name[:-3]))
+                for name in os.listdir(self.weights_dir)
+                if name.endswith(".pt") and _step_of(name[:-3]) is not None
+            ]
+            weight_files.sort(key=lambda item: item[1])
+            for name, _ in weight_files[:-self.save_total_limit]:
+                try:
+                    os.remove(os.path.join(self.weights_dir, name))
+                except OSError:
+                    pass
+                logger.info("Pruned old checkpoint weights: %s", name)
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)

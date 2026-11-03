@@ -20,6 +20,7 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+save_total_limit: 2   # 只保留最近N份checkpoint(state+weights); 0=不清理
 eval_every: 50
 eval_num_inference_steps: 10
 
