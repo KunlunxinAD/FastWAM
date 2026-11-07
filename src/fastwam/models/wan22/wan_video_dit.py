@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
 
 from fastwam.utils.logging_config import get_logger
+from . import p800_ops
 
 logger = get_logger(__name__)
 
@@ -52,6 +53,16 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, freqs, num_heads):
+    if (
+        p800_ops.enabled("FASTWAM_P800_ROPE")
+        and p800_ops.supported(x)
+        and num_heads == 24
+        and freqs.shape == (x.shape[1], 1, 64)
+        and freqs.is_complex()
+        and freqs.device == x.device
+        and not freqs.requires_grad
+    ):
+        return p800_ops.rotary(x, freqs, num_heads)
     batch_size, seq_len, _ = x.shape
     x_heads = x.view(batch_size, seq_len, num_heads, -1)
     x_out = torch.view_as_complex(
@@ -148,11 +159,22 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.register_buffer("_p800_unit_scale", None, persistent=False)
 
     def norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        if (
+            p800_ops.enabled("FASTWAM_P800_RMSNORM")
+            and p800_ops.supported(x)
+            and self.weight.dtype == x.dtype
+            and self.weight.device == x.device
+        ):
+            if self._p800_unit_scale is None:
+                with torch.inference_mode(False):
+                    self._p800_unit_scale = torch.ones_like(self.weight)
+            return p800_ops.rmsnorm(x, self.weight, self.eps, self._p800_unit_scale)
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
 
@@ -398,14 +420,27 @@ class WanVideoDiT(torch.nn.Module):
             logger.info("Using gradient checkpointing for DiT blocks. This will save memory but use more computation.")
 
     def _apply(self, fn):
+        self._p800_freq_cache = None
         result = super()._apply(fn)
         device = next(self.parameters()).device
         self.freqs = tuple(freqs.to(device=device) for freqs in self.freqs)
         return result
 
     def get_freqs(self, f: int, h: int, w: int) -> torch.Tensor:
+        if p800_ops.enabled("FASTWAM_P800_FREQ_CACHE") and torch.is_inference_mode_enabled():
+            with torch.inference_mode(False):
+                return self.get_freqs(f, h, w)
+        key = None
+        if p800_ops.enabled("FASTWAM_P800_FREQ_CACHE") and not any(
+            t.requires_grad or t.is_inference() for t in self.freqs
+        ):
+            key = (f, h, w, tuple((id(t), t.device, None if t.is_inference() else t._version)
+                                 for t in self.freqs))
+            cached = getattr(self, "_p800_freq_cache", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
         freq_f, freq_h, freq_w = self.freqs
-        return torch.cat(
+        result = torch.cat(
             [
                 freq_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
                 freq_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -413,6 +448,9 @@ class WanVideoDiT(torch.nn.Module):
             ],
             dim=-1,
         ).reshape(f * h * w, 1, -1)
+        if key is not None:
+            self._p800_freq_cache = (key, result)
+        return result
             
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
