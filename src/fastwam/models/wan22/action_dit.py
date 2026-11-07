@@ -10,6 +10,7 @@ from .wan_video_dit import (
     sinusoidal_embedding_1d,
     precompute_freqs_cis,
 )
+from . import p800_ops
 
 logger = get_logger(__name__)
 
@@ -100,13 +101,35 @@ class ActionDiT(nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def _apply(self, fn):
+        self._p800_freq_cache = None
         result = super()._apply(fn)
         device = next(self.parameters()).device
         self.freqs = self.freqs.to(device=device)
         return result
 
     def get_freqs(self, seq_len: int) -> torch.Tensor:
-        return self.freqs[:seq_len].view(seq_len, 1, -1)
+        if p800_ops.enabled("FASTWAM_P800_FREQ_CACHE") and torch.is_inference_mode_enabled():
+            with torch.inference_mode(False):
+                return self.get_freqs(seq_len)
+        key = None
+        if (
+            p800_ops.enabled("FASTWAM_P800_FREQ_CACHE")
+            and not self.freqs.requires_grad
+            and not self.freqs.is_inference()
+        ):
+            key = (
+                seq_len,
+                id(self.freqs),
+                self.freqs.device,
+                None if self.freqs.is_inference() else self.freqs._version,
+            )
+            cached = getattr(self, "_p800_freq_cache", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+        result = self.freqs[:seq_len].view(seq_len, 1, -1)
+        if key is not None:
+            self._p800_freq_cache = (key, result)
+        return result
 
     @classmethod
     def backbone_key_set(cls, keys) -> set[str]:
